@@ -599,3 +599,65 @@ class TestCompressedStorageLimit:
     def test_unreadable_archive_rejected(self, model_config):
         with pytest.raises(VLLMValidationError, match="prompt_embeds"):
             safe_load_prompt_embeds(model_config, base64.b64encode(b"PK\x03\x04"))
+
+
+def _legacy_saved(tensor: torch.Tensor) -> bytes:
+    """`torch.save` a tensor in the legacy (non-zip) serialization format."""
+    buffer = io.BytesIO()
+    torch.save(tensor, buffer, _use_new_zipfile_serialization=False)
+    return buffer.getvalue()
+
+
+class TestLegacyFormatRejected:
+    """The legacy (non-zip) `torch.save` format cannot be size-bounded.
+
+    `torch.load` allocates each storage at the element count declared in the
+    legacy payload's pickle header, before reading any bytes, so a few-KiB
+    payload can force a multi-GiB allocation that `VLLM_MAX_EMBED_DECODE_BYTES`
+    never sees. The format has not been `torch.save`'s default since PyTorch
+    1.6, so it is rejected as a client error rather than loaded.
+    """
+
+    def test_default_torch_save_is_zip(self):
+        # Guards the fix's premise: normal clients produce the zip format, so
+        # rejecting the legacy format does not reject well-formed payloads.
+        assert _encode_tensor(torch.zeros(1, 768))  # sanity: helper works
+        buffer = io.BytesIO()
+        torch.save(torch.zeros(1, 768), buffer)
+        assert buffer.getvalue()[:4] == b"PK\x03\x04"
+
+    @pytest.mark.parametrize("as_str", [False, True])
+    def test_prompt_embeds_legacy_payload_rejected(self, model_config, as_str):
+        encoded = base64.b64encode(_legacy_saved(torch.zeros(4, 768)))
+        payload = encoded.decode() if as_str else encoded
+
+        with pytest.raises(VLLMValidationError, match="zip archive"):
+            safe_load_prompt_embeds(model_config, payload)
+
+    @pytest.mark.parametrize("io_cls,parameter", EMBEDDING_MEDIA_IO)
+    def test_media_io_legacy_payload_rejected(self, io_cls, parameter):
+        encoded = base64.b64encode(_legacy_saved(torch.zeros(4, 16))).decode("utf-8")
+
+        with pytest.raises(VLLMValidationError, match=parameter):
+            io_cls().load_base64("", encoded)
+
+    def test_truncated_legacy_payload_rejected_before_allocation(self, model_config):
+        # A small legacy payload that declares a 64 MiB storage. The guard must
+        # reject it as a client error rather than let `torch.load` attempt the
+        # declared allocation; truncating the storage bytes keeps the payload
+        # tiny while the declared element count stays intact in the header.
+        declared = torch.zeros(64 * 1024 * 1024 // 4, dtype=torch.float32)
+        full = _legacy_saved(declared)
+        del declared
+        truncated = full[:4096]
+        assert truncated[:4] != b"PK\x03\x04"
+
+        with pytest.raises(VLLMValidationError, match="zip archive"):
+            safe_load_prompt_embeds(model_config, base64.b64encode(truncated))
+
+    def test_zip_payload_still_accepted(self, model_config):
+        tensor = torch.randn(10, 768)
+
+        loaded = safe_load_prompt_embeds(model_config, _encode_tensor(tensor))
+
+        assert torch.equal(loaded, tensor)

@@ -171,7 +171,8 @@ def test_a_long_reason_is_truncated_and_says_how_much_was_left_out(model_config)
         patch("vllm.utils.sparse_utils.torch.load", side_effect=RuntimeError(reason)),
         pytest.raises(VLLMValidationError) as excinfo,
     ):
-        safe_load_prompt_embeds(model_config, _encode(b"ignored"))
+        # A zip payload passes the archive guard and reaches the patched load.
+        safe_load_prompt_embeds(model_config, _encode(_saved_tensor(torch.zeros(1))))
 
     message = str(excinfo.value)
     assert "E" * _MAX_EMBED_ERROR_REASON_CHARS in message
@@ -189,7 +190,8 @@ def test_a_short_reason_is_passed_through_whole(model_config):
         patch("vllm.utils.sparse_utils.torch.load", side_effect=RuntimeError(reason)),
         pytest.raises(VLLMValidationError) as excinfo,
     ):
-        safe_load_prompt_embeds(model_config, _encode(b"ignored"))
+        # A zip payload passes the archive guard and reaches the patched load.
+        safe_load_prompt_embeds(model_config, _encode(_saved_tensor(torch.zeros(1))))
 
     message = str(excinfo.value)
     assert reason in message
@@ -208,7 +210,7 @@ def test_memory_exhaustion_remains_a_server_error(error):
         patch("vllm.utils.sparse_utils.torch.load", side_effect=error),
         pytest.raises(type(error)) as excinfo,
     ):
-        load_torch_payload(b"not a torch payload", parameter="image_embeds")
+        load_torch_payload(_saved_tensor(torch.zeros(1)), parameter="image_embeds")
 
     assert excinfo.value is error
     assert int(create_error_response(excinfo.value).error.code) == 500

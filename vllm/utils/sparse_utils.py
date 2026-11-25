@@ -69,10 +69,30 @@ def check_torch_archive_size(payload: bytes, *, parameter: str) -> None:
     `torch.load`, before `safe_to_dense()` sees the tensor, and a small view
     of a large storage keeps the whole storage alive. Reject archives whose
     entries add up to more than `VLLM_MAX_EMBED_DECODE_BYTES` before loading.
+
+    `torch.load` also accepts the legacy (non-zip) serialization format, whose
+    storages are allocated at a count the payload declares in its pickle
+    header, before any bytes are read. A few-KiB legacy payload can declare a
+    multi-GiB storage, and the allocation happens inside `torch.load` with no
+    archive directory to bound it, so the zip archive size cannot guard it.
+    Reject the legacy format outright: `torch.save` has defaulted to the zip
+    format since PyTorch 1.6, so only a caller that explicitly opts out of the
+    default produces it.
     """
     max_bytes = envs.VLLM_MAX_EMBED_DECODE_BYTES
-    if max_bytes <= 0 or payload[:4] != _ZIP_LOCAL_FILE_HEADER:
+    if max_bytes <= 0:
         return
+
+    if payload[:4] != _ZIP_LOCAL_FILE_HEADER:
+        raise VLLMValidationError(
+            f"`{parameter}` payload must be a `torch.save` zip archive. The "
+            "legacy (non-zip) serialization format is rejected because its "
+            "storage sizes cannot be bounded before `torch.load` allocates "
+            "them. Re-save the tensor with a current PyTorch (its default "
+            "produces the zip format), or set VLLM_MAX_EMBED_DECODE_BYTES=0 "
+            "to disable this check.",
+            parameter=parameter,
+        )
 
     try:
         with zipfile.ZipFile(BytesIO(payload)) as archive:
